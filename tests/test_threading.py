@@ -432,3 +432,99 @@ def test_sla_only_direct_children_count_as_responses():
     assert by_id["B"].response_message_id == "C"
     assert by_id["B"].status == "within_sla"
     assert by_id["C"].status == "overdue"
+
+
+# ---------------------------------------------------------------------------
+# normalize_subject / audit_thread_subjects：主题漂移审计（纯逻辑）
+# ---------------------------------------------------------------------------
+
+from app.threading import (  # noqa: E402
+    SubjectDriftGroup,
+    audit_thread_subjects,
+    normalize_subject,
+)
+
+
+def test_normalize_subject_strips_re_fw_fwd_case_insensitively():
+    assert normalize_subject("Re: hello") == "hello"
+    assert normalize_subject("RE: hello") == "hello"
+    assert normalize_subject("Fw: hello") == "hello"
+    assert normalize_subject("fwd: hello") == "hello"
+    # 连续叠加的前缀逐层剥离
+    assert normalize_subject("Re: Fw: Fwd: hello") == "hello"
+    assert normalize_subject("re:fw:hello") == "hello"
+
+
+def test_normalize_subject_collapses_whitespace():
+    assert normalize_subject("  Re:   hello \t world  ") == "hello world"
+    assert normalize_subject("项目  周报") == "项目 周报"
+
+
+def test_normalize_subject_requires_colon_and_keeps_other_words():
+    assert normalize_subject("Reply: hello") == "Reply: hello"
+    assert normalize_subject("Re hello") == "Re hello"
+    assert normalize_subject("Fw") == "Fw"
+    assert normalize_subject("") == ""
+
+
+def test_audit_thread_subjects_branch_baseline_and_groups():
+    msgs = {
+        "A": msg("A", sent="2026-09-18T08:00:00+00:00", subj="项目周报"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00",
+                 subj="Re: 项目周报"),
+        "C": msg("C", irt="B", refs=["A", "B"], sent="2026-09-18T10:00:00+00:00",
+                 subj="RE: Fw: 项目周报"),
+        "D": msg("D", irt="A", refs=["A"], sent="2026-09-18T11:00:00+00:00",
+                 subj="Fwd: 团建通知"),
+        "E": msg("E", irt="D", refs=["A", "D"], sent="2026-09-18T12:00:00+00:00",
+                 subj="re: 团建通知"),
+        "F": msg("F", irt="D", refs=["A", "D"], sent="2026-09-18T13:00:00+00:00",
+                 subj="值班表"),
+        "G": msg("G", irt="F", refs=["A", "D", "F"], sent="2026-09-18T14:00:00+00:00",
+                 subj="Re: 聚餐"),
+    }
+    parent_of = {"A": None, "B": "A", "C": "B", "D": "A", "E": "D", "F": "D", "G": "F"}
+    audit = audit_thread_subjects(msgs, parent_of)
+
+    # 稳定先序
+    assert [i.message_id for i in audit.items] == ["A", "B", "C", "D", "E", "F", "G"]
+    by_id = {i.message_id: i for i in audit.items}
+
+    # 根节点无基线、恒不偏离
+    assert by_id["A"].baseline_subject is None
+    assert by_id["A"].drifted is False
+    # 大小写不敏感前缀重复剥离后仍是根主题 -> 不偏离
+    assert by_id["B"].canonical_subject == "项目周报"
+    assert by_id["B"].drifted is False
+    assert by_id["C"].canonical_subject == "项目周报"
+    assert by_id["C"].drifted is False
+    # D 换话题 -> 偏离，分支基线仍是根主题
+    assert by_id["D"].canonical_subject == "团建通知"
+    assert by_id["D"].baseline_subject == "项目周报"
+    assert by_id["D"].drifted is True
+    # E 沿用 D 的新话题：以最近祖先 D 的规范主题为分支基线 -> 不偏离
+    assert by_id["E"].baseline_subject == "团建通知"
+    assert by_id["E"].drifted is False
+    # F/G 连续偏离（G 的基线是 F 偏离后的新主题）
+    assert by_id["F"].baseline_subject == "团建通知"
+    assert by_id["F"].drifted is True
+    assert by_id["G"].baseline_subject == "值班表"
+    assert by_id["G"].drifted is True
+
+    # 先序连续偏离合并：D 单独一组（被不偏离的 E 打断），F/G 合并一组
+    assert audit.drift_groups == [
+        SubjectDriftGroup(members=["D"], baseline_subject="项目周报"),
+        SubjectDriftGroup(members=["F", "G"], baseline_subject="团建通知"),
+    ]
+
+
+def test_audit_thread_subjects_no_drift_returns_empty_groups():
+    msgs = {
+        "A": msg("A", sent="2026-09-18T08:00:00+00:00", subj="例会通知"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00",
+                 subj="Re: 例会通知"),
+    }
+    parent_of = {"A": None, "B": "A"}
+    audit = audit_thread_subjects(msgs, parent_of)
+    assert [i.drifted for i in audit.items] == [False, False]
+    assert audit.drift_groups == []

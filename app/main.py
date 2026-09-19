@@ -25,6 +25,8 @@ from .schemas import (
     ThreadNodeOut,
     ThreadSlaEvaluateIn,
     ThreadSlaReport,
+    ThreadSubjectAuditIn,
+    ThreadSubjectAuditReport,
     UnfreezeIn,
     UnfreezeResult,
 )
@@ -38,12 +40,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
         "支持邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理，"
         "人工会话纠偏（POST /thread-corrections），"
-        "以及会话响应时限评估（POST /thread-sla/evaluate，只读）。"
+        "会话响应时限评估（POST /thread-sla/evaluate，只读），"
+        "以及会话主题漂移审计（POST /thread-subject-audit，只读）。"
     ),
     lifespan=lifespan,
 )
@@ -238,6 +241,24 @@ def get_thread_page(
 )
 def evaluate_thread_sla(payload: ThreadSlaEvaluateIn) -> dict:
     result = service.evaluate_thread_sla(payload)
+    if result is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    if result.get("invalid"):
+        raise HTTPException(
+            status_code=409,
+            detail="message belongs to a reference cycle and is not attached to any thread",
+        )
+    return result
+
+
+@app.post(
+    "/thread-subject-audit",
+    response_model=ThreadSubjectAuditReport,
+    tags=["threads"],
+    summary="只读审计某邮件当前整棵会话的主题漂移",
+)
+def audit_thread_subject(payload: ThreadSubjectAuditIn) -> dict:
+    result = service.audit_thread_subject(payload)
     if result is None:
         raise HTTPException(status_code=404, detail="message not found")
     if result.get("invalid"):

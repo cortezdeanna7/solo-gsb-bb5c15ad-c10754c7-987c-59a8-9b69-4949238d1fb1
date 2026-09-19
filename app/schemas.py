@@ -414,4 +414,67 @@ class ThreadSlaReport(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# 会话主题漂移审计
+# ---------------------------------------------------------------------------
+
+
+class ThreadSubjectAuditIn(BaseModel):
+    """POST /thread-subject-audit：只读审计某邮件当前整棵会话的主题漂移。"""
+
+    message_id: str = Field(..., min_length=1, description="会话内任一有效邮件 ID（审计锚点）")
+
+    @field_validator("message_id")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("message_id must not be empty")
+        return v
+
+
+class ThreadSubjectAuditItem(BaseModel):
+    """整棵会话中一封邮件的主题漂移判定。"""
+
+    message_id: str
+    parent_id: Optional[str]
+    depth: int
+    subject: str = Field(..., description="归档时的原始主题")
+    canonical_subject: str = Field(
+        ..., description="重复剥离大小写不敏感的 Re/Fw/Fwd 前缀并折叠空白后的规范主题"
+    )
+    baseline_subject: Optional[str] = Field(
+        None, description="分支基线：最近祖先（父节点）的规范主题；根节点为 null"
+    )
+    drifted: bool = Field(
+        ..., description="规范主题是否偏离分支基线；根节点无基线、恒为 false"
+    )
+
+
+class SubjectDriftGroupOut(BaseModel):
+    """先序序列中连续的一段偏离节点。"""
+
+    members: list[str] = Field(..., description="先序连续的偏离节点 message_id")
+    baseline_subject: str = Field(
+        ..., description="该组首个节点所偏离的分支基线（其最近祖先的规范主题）"
+    )
+
+
+class ThreadSubjectAuditReport(BaseModel):
+    """POST /thread-subject-audit：整棵会话的主题漂移审计结论。"""
+
+    message_id: str = Field(..., description="审计锚点邮件 ID")
+    root_id: str = Field(..., description="审计时刻该邮件所在会话的根")
+    revision: str = Field(
+        ...,
+        description="审计基于的当前整棵会话拓扑 revision（与 GET /threads/{message_id} 一致）",
+    )
+    results: list[ThreadSubjectAuditItem] = Field(
+        ..., description="逐节点判定结果，按稳定先序排列"
+    )
+    drift_groups: list[SubjectDriftGroupOut] = Field(
+        ..., description="按先序合并的连续偏离节点分组"
+    )
+
+
 TreeNode.model_rebuild()

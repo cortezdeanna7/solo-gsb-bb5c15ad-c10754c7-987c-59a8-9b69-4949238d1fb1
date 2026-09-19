@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Optional
@@ -604,3 +605,125 @@ def evaluate_thread_sla(
 
     summary = {"total": len(items), **counts}
     return ThreadSlaEvaluation(items=items, anomalies=anomalies, summary=summary)
+
+
+# ---------------------------------------------------------------------------
+# 会话主题漂移审计：纯逻辑，只读
+# ---------------------------------------------------------------------------
+
+# 大小写不敏感的 Re:/Fw:/Fwd: 前缀（须带冒号），重复剥离直至不再匹配。
+_SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd)\s*:\s*", re.IGNORECASE)
+
+
+def normalize_subject(subject: str) -> str:
+    """计算规范主题：重复剥离大小写不敏感的 Re/Fw/Fwd 前缀并折叠空白。
+
+    前缀必须带冒号（Re: / Fw: / Fwd:），大小写不限，可连续叠加出现
+    （"Re: Fw: x" 逐层剥离）；随后把任意连续空白折叠为单个空格并去除
+    首尾空白。漂移判定按规范主题精确相等比较。
+    """
+
+    s = subject
+    while True:
+        stripped = _SUBJECT_PREFIX_RE.sub("", s, count=1)
+        if stripped == s:
+            break
+        s = stripped
+    return " ".join(s.split())
+
+
+@dataclass(frozen=True)
+class SubjectAuditItem:
+    """一封邮件的主题漂移判定。
+
+    baseline_subject 为分支基线（最近祖先——即父节点——的规范主题）；
+    根节点无祖先，baseline 为 None 且恒不偏离。
+    """
+
+    message_id: str
+    parent_id: Optional[str]
+    depth: int
+    subject: str
+    canonical_subject: str
+    baseline_subject: Optional[str]
+    drifted: bool
+
+
+@dataclass(frozen=True)
+class SubjectDriftGroup:
+    """先序序列中连续的一段偏离节点；baseline_subject 为组首节点偏离的基线。"""
+
+    members: list[str]
+    baseline_subject: str
+
+
+@dataclass(frozen=True)
+class ThreadSubjectAudit:
+    """整棵会话的主题漂移审计结论（items 按稳定先序排列）。"""
+
+    items: list[SubjectAuditItem]
+    drift_groups: list[SubjectDriftGroup]
+
+
+def audit_thread_subjects(
+    messages: dict[str, ThreadMessage],
+    parent_of: dict[str, Optional[str]],
+) -> ThreadSubjectAudit:
+    """对整棵会话逐节点审计主题漂移（纯函数，不改动任何输入）。
+
+    - 按稳定先序遍历（与 build_flat_tree 同一套排序）；
+    - 每个节点的分支基线 = 其最近祖先（父节点）的规范主题；根节点无基线、
+      恒不偏离（它定义整棵树的初始基线）；
+    - 父节点自身偏离时，子节点以父节点偏离后的新主题为基线——分支基线
+      随谱系逐层更新，沿用新话题的分支不再视为漂移；
+    - 节点规范主题与基线不同即偏离（精确比较）；
+    - drift_groups 把先序序列中连续偏离的节点合并为一组，组首节点所
+      偏离的基线记为该组的 baseline_subject。
+    """
+
+    roots, children = _sorted_tree(messages, parent_of)
+
+    items: list[SubjectAuditItem] = []
+    drift_groups: list[SubjectDriftGroup] = []
+    group_members: list[str] = []
+    group_baseline: Optional[str] = None
+
+    def flush_group() -> None:
+        nonlocal group_members, group_baseline
+        if group_members:
+            # 偏离节点必有基线（根节点恒不偏离，不会进入分组）
+            drift_groups.append(SubjectDriftGroup(
+                members=group_members,
+                baseline_subject=group_baseline if group_baseline is not None else "",
+            ))
+        group_members = []
+        group_baseline = None
+
+    def visit(mid: str, depth: int, baseline: Optional[str]) -> None:
+        nonlocal group_members, group_baseline
+        msg = messages[mid]
+        canonical = normalize_subject(msg.subject)
+        drifted = baseline is not None and canonical != baseline
+        items.append(SubjectAuditItem(
+            message_id=mid,
+            parent_id=parent_of.get(mid),
+            depth=depth,
+            subject=msg.subject,
+            canonical_subject=canonical,
+            baseline_subject=baseline,
+            drifted=drifted,
+        ))
+        if drifted:
+            if not group_members:
+                group_baseline = baseline
+            group_members.append(mid)
+        else:
+            flush_group()
+        for kid in children.get(mid, []):
+            visit(kid, depth + 1, canonical)
+
+    for root in roots:
+        visit(root, 0, None)
+    flush_group()
+
+    return ThreadSubjectAudit(items=items, drift_groups=drift_groups)

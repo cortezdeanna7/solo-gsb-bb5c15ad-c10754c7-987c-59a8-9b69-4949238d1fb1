@@ -1684,3 +1684,157 @@ def test_thread_sla_is_read_only(client):
     assert client.get(f"/batches/{batch['batch_id']}").json() == batch
     assert client.get("/messages/A").json() == msg_before
     assert client.get("/threads/A").json() == thread_before
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-subject-audit：会话主题漂移审计（只读）
+# ---------------------------------------------------------------------------
+
+
+def _seed_subject_drift_thread(client):
+    """A(项目周报) -> B -> C；A -> D(团建通知, 漂移) -> E；D -> F(值班表, 漂移) -> G(聚餐, 漂移)。"""
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00", subject="项目周报"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00",
+           subject="Re: 项目周报"),
+        _m("C", irt="B", refs=["A", "B"], sent="2026-09-18T10:00:00+00:00",
+           subject="RE: Fw: 项目周报"),
+        _m("D", irt="A", refs=["A"], sent="2026-09-18T11:00:00+00:00",
+           subject="Fwd: 团建通知"),
+        _m("E", irt="D", refs=["A", "D"], sent="2026-09-18T12:00:00+00:00",
+           subject="re: 团建通知"),
+        _m("F", irt="D", refs=["A", "D"], sent="2026-09-18T13:00:00+00:00",
+           subject="值班表"),
+        _m("G", irt="F", refs=["A", "D", "F"], sent="2026-09-18T14:00:00+00:00",
+           subject="Re: 聚餐"),
+    ]})
+
+
+def test_thread_subject_audit_reports_canonical_drift_and_groups(client):
+    _seed_subject_drift_thread(client)
+    r = client.post("/thread-subject-audit", json={"message_id": "G"})  # 锚点可以是深层节点
+    assert r.status_code == 200
+    body = r.json()
+    assert body["message_id"] == "G"
+    assert body["root_id"] == "A"
+    # revision 与 GET /threads 一致（同一整棵会话拓扑）
+    assert body["revision"] == client.get("/threads/G").json()["revision"]
+
+    # 逐节点按稳定先序排列
+    assert [it["message_id"] for it in body["results"]] == [
+        "A", "B", "C", "D", "E", "F", "G",
+    ]
+    by_id = {it["message_id"]: it for it in body["results"]}
+
+    root = by_id["A"]
+    assert root["parent_id"] is None
+    assert root["depth"] == 0
+    assert root["subject"] == "项目周报"
+    assert root["canonical_subject"] == "项目周报"
+    assert root["baseline_subject"] is None
+    assert root["drifted"] is False
+
+    # 大小写不敏感 Re/Fw 前缀重复剥离后仍是根主题 -> 不偏离
+    assert by_id["C"]["subject"] == "RE: Fw: 项目周报"
+    assert by_id["C"]["canonical_subject"] == "项目周报"
+    assert by_id["C"]["baseline_subject"] == "项目周报"
+    assert by_id["C"]["drifted"] is False
+
+    # D 换话题 -> 偏离；其分支基线仍是根主题
+    assert by_id["D"]["canonical_subject"] == "团建通知"
+    assert by_id["D"]["baseline_subject"] == "项目周报"
+    assert by_id["D"]["drifted"] is True
+
+    # E 沿用 D 的新话题：以最近祖先 D 的规范主题为分支基线 -> 不偏离
+    assert by_id["E"]["canonical_subject"] == "团建通知"
+    assert by_id["E"]["baseline_subject"] == "团建通知"
+    assert by_id["E"]["drifted"] is False
+
+    # F/G 连续偏离（G 的基线是 F 偏离后的新主题）
+    assert by_id["F"]["baseline_subject"] == "团建通知"
+    assert by_id["F"]["drifted"] is True
+    assert by_id["G"]["canonical_subject"] == "聚餐"
+    assert by_id["G"]["baseline_subject"] == "值班表"
+    assert by_id["G"]["drifted"] is True
+
+    # 先序连续偏离合并：D 单独一组（被不偏离的 E 打断），F/G 合并一组
+    assert body["drift_groups"] == [
+        {"members": ["D"], "baseline_subject": "项目周报"},
+        {"members": ["F", "G"], "baseline_subject": "团建通知"},
+    ]
+
+
+def test_thread_subject_audit_no_drift_returns_empty_groups(client):
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00", subject="例会通知"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00",
+           subject="Re: 例会通知"),
+        _m("C", irt="B", refs=["A", "B"], sent="2026-09-18T10:00:00+00:00",
+           subject="Fwd: 例会通知"),
+    ]})
+    body = client.post("/thread-subject-audit", json={"message_id": "C"}).json()
+    assert [it["drifted"] for it in body["results"]] == [False, False, False]
+    assert body["drift_groups"] == []
+
+
+def test_thread_subject_audit_collapses_whitespace(client):
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00", subject="项目 周报"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00",
+           subject="Re:  项目   周报 "),
+        _m("C", irt="A", refs=["A"], sent="2026-09-18T10:00:00+00:00",
+           subject="Re: 项目周报"),
+    ]})
+    body = client.post("/thread-subject-audit", json={"message_id": "A"}).json()
+    by_id = {it["message_id"]: it for it in body["results"]}
+    # 任意连续空白折叠为单个空格：B 与根规范主题一致 -> 不偏离
+    assert by_id["B"]["canonical_subject"] == "项目 周报"
+    assert by_id["B"]["drifted"] is False
+    # C 折叠后无空格，与根规范主题不同 -> 偏离
+    assert by_id["C"]["canonical_subject"] == "项目周报"
+    assert by_id["C"]["drifted"] is True
+    assert body["drift_groups"] == [
+        {"members": ["C"], "baseline_subject": "项目 周报"},
+    ]
+
+
+def test_thread_subject_audit_unknown_message_404(client):
+    r = client.post("/thread-subject-audit", json={"message_id": "ghost"})
+    assert r.status_code == 404
+
+
+def test_thread_subject_audit_cycle_message_409(client):
+    client.post("/batches", json={"messages": [
+        _m("x", irt="y", refs=["y"]),
+        _m("y", irt="x", refs=["x"]),
+    ]})
+    r = client.post("/thread-subject-audit", json={"message_id": "x"})
+    assert r.status_code == 409
+
+
+def test_thread_subject_audit_invalid_payload_422(client):
+    assert client.post(
+        "/thread-subject-audit", json={"message_id": "   "}
+    ).status_code == 422
+    assert client.post("/thread-subject-audit", json={}).status_code == 422
+
+
+def test_thread_subject_audit_is_read_only(client):
+    batch = client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00", subject="周报"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00",
+           subject="新话题"),
+    ]}).json()
+    msg_before = client.get("/messages/A").json()
+    thread_before = client.get("/threads/A").json()
+
+    r = client.post("/thread-subject-audit", json={"message_id": "A"})
+    assert r.status_code == 200
+    assert r.json()["drift_groups"] == [
+        {"members": ["B"], "baseline_subject": "周报"},
+    ]
+
+    # 批次快照、邮件、会话树均不被改写
+    assert client.get(f"/batches/{batch['batch_id']}").json() == batch
+    assert client.get("/messages/A").json() == msg_before
+    assert client.get("/threads/A").json() == thread_before

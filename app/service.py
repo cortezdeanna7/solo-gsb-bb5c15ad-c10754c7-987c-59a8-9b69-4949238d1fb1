@@ -20,6 +20,7 @@ from .schemas import (
     RelinkIn,
     ThreadCorrectionIn,
     ThreadSlaEvaluateIn,
+    ThreadSubjectAuditIn,
     UnfreezeIn,
 )
 from .threading import RetentionCleanupPlan, ThreadMessage
@@ -912,6 +913,61 @@ def evaluate_thread_sla(payload: ThreadSlaEvaluateIn) -> Optional[dict]:
                     "parent_sent_at": a.parent_sent_at,
                 }
                 for a in evaluation.anomalies
+            ],
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-subject-audit：会话主题漂移审计（只读）
+# ---------------------------------------------------------------------------
+
+
+def audit_thread_subject(payload: ThreadSubjectAuditIn) -> Optional[dict]:
+    """只读审计某邮件当前所在整棵会话的主题漂移。
+
+    未知邮件返回 None（-> 404）；环内 invalid 邮件返回 {"invalid": True}
+    （-> 409）。只读取当前 messages 表：revision 与逐节点判定基于同一次
+    装载的整棵会话，不写库、不改写批次快照与诊断明细。
+    """
+
+    conn = database.connect()
+    try:
+        row = conn.execute(
+            "SELECT is_invalid FROM messages WHERE message_id = ?",
+            (payload.message_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["is_invalid"]:
+            return {"invalid": True, "message_id": payload.message_id}
+
+        root_id = _climb_root(conn, payload.message_id)
+        msgs, parents = _load_subtree(conn, root_id)
+        audit = threading.audit_thread_subjects(msgs, parents)
+        return {
+            "message_id": payload.message_id,
+            "root_id": root_id,
+            "revision": _tree_revision(msgs, parents),
+            "results": [
+                {
+                    "message_id": item.message_id,
+                    "parent_id": item.parent_id,
+                    "depth": item.depth,
+                    "subject": item.subject,
+                    "canonical_subject": item.canonical_subject,
+                    "baseline_subject": item.baseline_subject,
+                    "drifted": item.drifted,
+                }
+                for item in audit.items
+            ],
+            "drift_groups": [
+                {
+                    "members": group.members,
+                    "baseline_subject": group.baseline_subject,
+                }
+                for group in audit.drift_groups
             ],
         }
     finally:

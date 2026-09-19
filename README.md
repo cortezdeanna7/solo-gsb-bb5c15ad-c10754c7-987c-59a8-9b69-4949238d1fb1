@@ -5,9 +5,10 @@
 并给出**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，
 可随时查询。此外支持**会话活跃冻结 / 解除冻结**、按保留期的**到期批量清理**
 （删除中间节点时自动压缩会话树，支持 `dry_run` 预览）、**人工会话纠偏**
-（`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点），
-以及**会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
-响应是否落在时限内）。
+（`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点）、
+**会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
+响应是否落在时限内），以及**会话主题漂移审计**（`POST /thread-subject-audit`，
+只读地按分支基线逐节点判定主题漂移并归并连续偏离分组）。
 
 ## 一条命令启动
 
@@ -57,6 +58,7 @@ ports:
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树与当前拓扑 `revision`；环邮件返回 **409** |
 | `GET` | `/threads/{message_id}/page?limit=&cursor=` | 会话树**游标分页**（先序扁平展开，含 `depth`），适配大型会话 |
 | `POST` | `/thread-sla/evaluate` | **会话响应时限评估**：只读逐封判定整棵会话的响应是否落在 `threshold_seconds` 内 |
+| `POST` | `/thread-subject-audit` | **会话主题漂移审计**：只读按分支基线逐节点判定主题漂移，并归并连续偏离分组 |
 | `POST` | `/retention/freezes` | **活跃冻结**某封有效邮件当前所在的整棵会话（保护范围随会话拓扑自动扩张） |
 | `POST` | `/retention/unfreezes` | **解除**以某封邮件为锚点的冻结 |
 | `POST` | `/retention/cleanups` | **批量清理**截止时间前到期、且未受冻结保护的有效邮件（可 `dry_run`） |
@@ -70,6 +72,7 @@ ports:
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 `POST /thread-sla/evaluate` 锚点邮件未知返回 **404**，锚点为环内邮件返回 **409**。
+`POST /thread-subject-audit` 锚点邮件未知返回 **404**，锚点为环内邮件返回 **409**。
 `POST /thread-corrections` 的错误码见下节（待调整邮件 / 目标父未知 **404**；
 环内邮件、revision 不匹配、自挂/成环均为 **409** 且不写库）。
 
@@ -397,6 +400,57 @@ curl -X POST http://localhost:8000/thread-sla/evaluate \
   ],
   "summary": {"total": 3, "within_sla": 1, "late": 1, "pending": 1, "overdue": 0},
   "chronology_anomalies": []            // sent_at 早于父邮件的直接子邮件
+}
+```
+
+### 会话主题漂移审计：`POST /thread-subject-audit`
+
+以会话内**任意一封有效邮件为锚点**，对其**当前所在的整棵有效会话**审计主题漂移。
+接口**只读**：不写库、不改写批次快照与诊断明细。
+
+请求体仅含 `message_id`（审计锚点）。判定规则：
+
+- **规范主题**：对每封邮件的 `subject` 重复剥离大小写不敏感的
+  `Re:` / `Fw:` / `Fwd:` 前缀（须带冒号，可连续叠加，如 `Re: Fw: x` 逐层剥离），
+  随后把任意连续空白折叠为单个空格并去除首尾空白；
+- **分支基线**：按稳定先序遍历整棵会话，每个节点以其**最近祖先（父节点）的
+  规范主题**为分支基线；根节点无基线、恒不偏离（它定义整棵树的初始基线）。
+  父节点自身偏离时，子节点以父节点偏离后的新主题为基线——沿用新话题的
+  分支不再视为漂移；
+- **偏离判定**：节点规范主题与分支基线不同即 `drifted: true`（精确比较）；
+- **drift_groups**：把先序序列中**连续偏离**的节点合并为一组，
+  `baseline_subject` 为组首节点所偏离的基线。
+
+响应包含审计基于的当前整棵会话拓扑 `revision`（与 `GET /threads/{message_id}`
+一致）、按稳定先序排列的逐节点结果 `results`（原主题、规范主题、分支基线、
+是否偏离）以及 `drift_groups`。锚点邮件未知返回 **404**；锚点为环内
+`invalid` 邮件（不属于任何会话）返回 **409**。
+
+```bash
+curl -X POST http://localhost:8000/thread-subject-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"message_id": "C"}'
+```
+
+```jsonc
+{
+  "message_id": "C",
+  "root_id": "A",
+  "revision": "9f1a…",                 // 与 GET /threads/C 相同的拓扑摘要
+  "results": [                          // 稳定先序：A -> B -> C
+    {"message_id": "A", "parent_id": null, "depth": 0,
+     "subject": "项目周报", "canonical_subject": "项目周报",
+     "baseline_subject": null, "drifted": false},
+    {"message_id": "B", "parent_id": "A", "depth": 1,
+     "subject": "Re: 项目周报", "canonical_subject": "项目周报",
+     "baseline_subject": "项目周报", "drifted": false},
+    {"message_id": "C", "parent_id": "B", "depth": 2,
+     "subject": "Fwd: 团建通知", "canonical_subject": "团建通知",
+     "baseline_subject": "项目周报", "drifted": true}
+  ],
+  "drift_groups": [                     // 先序连续偏离节点合并成组
+    {"members": ["C"], "baseline_subject": "项目周报"}
+  ]
 }
 ```
 
