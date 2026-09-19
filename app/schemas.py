@@ -415,3 +415,74 @@ class ThreadSlaReport(BaseModel):
 
 
 TreeNode.model_rebuild()
+
+
+# ---------------------------------------------------------------------------
+# 主题漂移审计（只读）
+# ---------------------------------------------------------------------------
+
+
+class ThreadSubjectAuditIn(BaseModel):
+    """POST /thread-subject-audit：只读审计某邮件当前整棵会话的主题漂移。"""
+
+    message_id: str = Field(..., min_length=1, description="会话内任一有效邮件 ID（审计锚点）")
+
+    @field_validator("message_id")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("message_id must not be empty")
+        return v
+
+
+class SubjectDriftItemOut(BaseModel):
+    """整棵会话中一封邮件的主题漂移判定，按稳定先序排列。"""
+
+    message_id: str
+    parent_id: Optional[str]
+    sent_at: datetime
+    depth: int
+    subject: str = Field(..., description="邮件原始主题（归档时原样）")
+    canonical_subject: str = Field(
+        ...,
+        description="规范主题：重复剥离大小写不敏感的 Re/Fw/Fwd 前缀并折叠空白后的结果",
+    )
+    baseline_subject: Optional[str] = Field(
+        ...,
+        description=(
+            "分支基线：最近祖先（直接父节点）的规范主题；"
+            "根节点没有祖先，为 null 且 drifted 恒为 false"
+        ),
+    )
+    drifted: bool = Field(
+        ..., description="规范主题是否偏离分支基线（与父节点规范主题精确比较；根节点恒 false）"
+    )
+
+
+class SubjectDriftGroupOut(BaseModel):
+    """先序遍历中一段连续偏离基线的节点（跨分支的连续段也合并为一组）。"""
+
+    start_message_id: str
+    end_message_id: str
+    message_ids: list[str] = Field(
+        ..., description="组内全部节点 ID，按稳定先序排列"
+    )
+    count: int
+
+
+class ThreadSubjectAuditReport(BaseModel):
+    """POST /thread-subject-audit：整棵会话的主题漂移审计结论。"""
+
+    message_id: str = Field(..., description="审计锚点邮件 ID")
+    root_id: str = Field(..., description="审计时刻该邮件所在会话的根")
+    revision: str = Field(
+        ...,
+        description="审计基于的当前整棵会话拓扑 revision（与 GET /threads/{message_id} 一致）",
+    )
+    results: list[SubjectDriftItemOut] = Field(
+        ..., description="逐节点的原主题 / 规范主题 / 基线 / 偏离标记，按稳定先序排列"
+    )
+    drift_groups: list[SubjectDriftGroupOut] = Field(
+        ..., description="按先序合并连续偏离节点得到的漂移分组"
+    )

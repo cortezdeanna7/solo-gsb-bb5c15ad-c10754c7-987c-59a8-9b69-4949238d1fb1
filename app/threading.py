@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Optional
@@ -604,3 +605,130 @@ def evaluate_thread_sla(
 
     summary = {"total": len(items), **counts}
     return ThreadSlaEvaluation(items=items, anomalies=anomalies, summary=summary)
+
+
+# ---------------------------------------------------------------------------
+# 主题漂移审计：纯逻辑，只读
+# ---------------------------------------------------------------------------
+
+# 一个 Re/Fw/Fwd 前缀标记：大小写不敏感，标记与冒号之间允许空白；
+# 标记前的空白与冒号后到下一个标记（或正文）之间的空白统一在剥离完成后
+# 折叠，故允许重复嵌套（如 "  Re: Fwd: 主题"）。
+_SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd)\s*:\s*", re.IGNORECASE)
+# 任意连续空白（含制表符、换行）折叠为单个空格
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def canonicalize_subject(subject: str) -> str:
+    """把邮件主题规范化：重复剥离大小写不敏感的 Re/Fw/Fwd 前缀并折叠空白。
+
+    - 前缀形如 ``Re:`` / ``FW:`` / ``Fwd:``（大小写不敏感，标记与冒号之间
+      允许空白），重复出现（如 ``Re: Fwd: 主题``）则从左到右逐个剥离，
+      直到不再以前缀开头；
+    - 随后把所有连续空白折叠为单个空格并去掉首尾空白。
+    """
+
+    s = subject
+    while True:
+        stripped = _SUBJECT_PREFIX_RE.sub("", s, count=1)
+        if stripped == s:
+            break
+        s = stripped
+    return _WHITESPACE_RE.sub(" ", s).strip()
+
+
+@dataclass(frozen=True)
+class SubjectDriftItem:
+    """整棵会话中一封邮件的主题漂移判定。
+
+    baseline_subject 为最近祖先（即直接父节点）的规范主题；根节点没有
+    祖先，baseline 为 None 且 drifted 恒为 False。
+    """
+
+    message_id: str
+    parent_id: Optional[str]
+    sent_at: str
+    depth: int
+    subject: str = field(compare=False)
+    canonical_subject: str
+    baseline_subject: Optional[str]
+    drifted: bool
+
+
+@dataclass(frozen=True)
+class SubjectDriftGroup:
+    """先序遍历中一段连续偏离基线的节点（跨分支的连续段也合并为一组）。"""
+
+    start_message_id: str
+    end_message_id: str
+    message_ids: list[str]
+    count: int
+
+
+@dataclass(frozen=True)
+class SubjectDriftAudit:
+    """整棵会话的主题漂移审计结论（items 按稳定先序排列）。"""
+
+    items: list[SubjectDriftItem]
+    drift_groups: list[SubjectDriftGroup]
+
+
+def audit_subject_drift(
+    messages: dict[str, ThreadMessage],
+    parent_of: dict[str, Optional[str]],
+) -> SubjectDriftAudit:
+    """按稳定先序遍历审计整棵会话的主题漂移（纯函数，不改动任何输入）。
+
+    每个节点以其**最近祖先**（即直接父节点；先序遍历中父节点总是先于
+    子节点被访问）的规范主题作为分支基线：规范主题与基线不同即偏离。
+    根节点没有祖先，不参与偏离判定。先序序列中**连续偏离**的节点
+    （即使跨越不同子分支）合并为一个 drift_group。
+    """
+
+    roots, children = _sorted_tree(messages, parent_of)
+
+    items: list[SubjectDriftItem] = []
+
+    def visit(mid: str, depth: int, baseline: Optional[str]) -> None:
+        canonical = canonicalize_subject(messages[mid].subject)
+        drifted = baseline is not None and canonical != baseline
+        items.append(SubjectDriftItem(
+            message_id=mid,
+            parent_id=parent_of.get(mid),
+            sent_at=messages[mid].sent_at,
+            depth=depth,
+            subject=messages[mid].subject,
+            canonical_subject=canonical,
+            baseline_subject=baseline,
+            drifted=drifted,
+        ))
+        # 子节点的最近祖先即本节点
+        for kid in children.get(mid, []):
+            visit(kid, depth + 1, canonical)
+
+    for root in roots:
+        visit(root, 0, None)
+
+    # 合并先序序列中连续的偏离节点
+    drift_groups: list[SubjectDriftGroup] = []
+    run: list[str] = []
+    for item in items:
+        if item.drifted:
+            run.append(item.message_id)
+        elif run:
+            drift_groups.append(SubjectDriftGroup(
+                start_message_id=run[0],
+                end_message_id=run[-1],
+                message_ids=list(run),
+                count=len(run),
+            ))
+            run = []
+    if run:
+        drift_groups.append(SubjectDriftGroup(
+            start_message_id=run[0],
+            end_message_id=run[-1],
+            message_ids=list(run),
+            count=len(run),
+        ))
+
+    return SubjectDriftAudit(items=items, drift_groups=drift_groups)

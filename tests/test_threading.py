@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from app.threading import (
     ThreadMessage,
+    audit_subject_drift,
     build_flat_tree,
     build_forest,
+    canonicalize_subject,
     plan_retention_cleanup,
     resolve_batch,
 )
@@ -432,3 +434,92 @@ def test_sla_only_direct_children_count_as_responses():
     assert by_id["B"].response_message_id == "C"
     assert by_id["B"].status == "within_sla"
     assert by_id["C"].status == "overdue"
+
+
+# ---------------------------------------------------------------------------
+# 主题规范化与主题漂移审计
+# ---------------------------------------------------------------------------
+
+
+def test_canonicalize_subject_strips_repeated_prefixes_case_insensitive():
+    assert canonicalize_subject("Re: Hello") == "Hello"
+    assert canonicalize_subject("RE: FW: Fwd: Hello") == "Hello"
+    assert canonicalize_subject("re :FWD:  Hello") == "Hello"     # 标记与冒号间允许空白
+    assert canonicalize_subject("re:re:re: x") == "x"
+    # 大小写不敏感只作用于前缀标记，正文大小写保留
+    assert canonicalize_subject("RE: Weekly Meeting") == "Weekly Meeting"
+    # 无冒号不算前缀
+    assert canonicalize_subject("Re Hello") == "Re Hello"
+    # 空白折叠：制表符/换行/连续空格 -> 单空格并去首尾
+    assert canonicalize_subject("  Re:\tA\n B  ") == "A B"
+    # 无前缀时仅折叠空白
+    assert canonicalize_subject("a   b") == "a b"
+    # 边界
+    assert canonicalize_subject("Re:") == ""
+    assert canonicalize_subject("   ") == ""
+    assert canonicalize_subject("Reply: x") == "Reply: x"
+
+
+def test_subject_audit_baseline_is_nearest_ancestor_and_groups_merged():
+    msgs = {
+        "A": msg("A", sent="2026-09-18T08:00:00+00:00", subj="Plan"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T08:30:00+00:00",
+                 subj="Re: Fork One"),
+        "C": msg("C", irt="B", refs=["A", "B"], sent="2026-09-18T08:45:00+00:00",
+                 subj="Re: Fork One"),
+        "D": msg("D", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00",
+                 subj="Re: Fork Two"),
+    }
+    parent_of = {"A": None, "B": "A", "C": "B", "D": "A"}
+    audit = audit_subject_drift(msgs, parent_of)
+
+    assert [i.message_id for i in audit.items] == ["A", "B", "C", "D"]
+    flags = {i.message_id: i.drifted for i in audit.items}
+    assert flags == {"A": False, "B": True, "C": False, "D": True}
+
+    by_id = {i.message_id: i for i in audit.items}
+    assert by_id["A"].baseline_subject is None
+    assert by_id["B"].baseline_subject == "Plan"
+    assert by_id["C"].baseline_subject == "Fork One"
+    assert by_id["D"].baseline_subject == "Plan"
+    assert [i.depth for i in audit.items] == [0, 1, 2, 1]
+
+    # B 与 D 被不偏离的 C 隔开 -> 两个分组
+    assert [
+        (g.start_message_id, g.end_message_id, g.message_ids, g.count)
+        for g in audit.drift_groups
+    ] == [("B", "B", ["B"], 1), ("D", "D", ["D"], 1)]
+
+
+def test_subject_audit_consecutive_drift_spans_branches():
+    # B、C 子树整体偏离，随后另一分支 D 也偏离：先序连续 -> 合并为一组
+    msgs = {
+        "A": msg("A", sent="2026-09-18T08:00:00+00:00", subj="Plan"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T08:30:00+00:00",
+                 subj="Re: Fork One"),
+        "C": msg("C", irt="B", refs=["A", "B"], sent="2026-09-18T08:45:00+00:00",
+                 subj="Re: Fork One"),
+        "D": msg("D", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00",
+                 subj="Re: Fork Two"),
+    }
+    parent_of = {"A": None, "B": "A", "C": "B", "D": "A"}
+    # C 改为偏离 B（换题但仍在同一子分支），B、C、D 先序连续偏离
+    msgs["C"] = msg("C", irt="B", refs=["A", "B"],
+                    sent="2026-09-18T08:45:00+00:00", subj="Re: Deeper")
+    audit = audit_subject_drift(msgs, parent_of)
+    assert [i.drifted for i in audit.items] == [False, True, True, True]
+    (g,) = audit.drift_groups
+    assert g.start_message_id == "B" and g.end_message_id == "D"
+    assert g.message_ids == ["B", "C", "D"] and g.count == 3
+
+
+def test_subject_audit_root_never_drifts():
+    audit = audit_subject_drift(
+        {"S": msg("S", sent="2026-09-18T08:00:00+00:00", subj="Re: 仅一封")},
+        {"S": None},
+    )
+    (only,) = audit.items
+    assert only.canonical_subject == "仅一封"
+    assert only.baseline_subject is None
+    assert only.drifted is False
+    assert audit.drift_groups == []

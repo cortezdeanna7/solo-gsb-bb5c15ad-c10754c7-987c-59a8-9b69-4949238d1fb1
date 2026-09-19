@@ -6,8 +6,9 @@
 可随时查询。此外支持**会话活跃冻结 / 解除冻结**、按保留期的**到期批量清理**
 （删除中间节点时自动压缩会话树，支持 `dry_run` 预览）、**人工会话纠偏**
 （`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点），
-以及**会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
-响应是否落在时限内）。
+**会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
+响应是否落在时限内），以及**会话主题漂移审计**
+（`POST /thread-subject-audit`，只读地逐节点比对分支基线、合并连续漂移段）。
 
 ## 一条命令启动
 
@@ -57,6 +58,7 @@ ports:
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树与当前拓扑 `revision`；环邮件返回 **409** |
 | `GET` | `/threads/{message_id}/page?limit=&cursor=` | 会话树**游标分页**（先序扁平展开，含 `depth`），适配大型会话 |
 | `POST` | `/thread-sla/evaluate` | **会话响应时限评估**：只读逐封判定整棵会话的响应是否落在 `threshold_seconds` 内 |
+| `POST` | `/thread-subject-audit` | **主题漂移审计**：只读逐节点比对最近祖先的规范主题，返回连续偏离合并出的 `drift_groups` |
 | `POST` | `/retention/freezes` | **活跃冻结**某封有效邮件当前所在的整棵会话（保护范围随会话拓扑自动扩张） |
 | `POST` | `/retention/unfreezes` | **解除**以某封邮件为锚点的冻结 |
 | `POST` | `/retention/cleanups` | **批量清理**截止时间前到期、且未受冻结保护的有效邮件（可 `dry_run`） |
@@ -70,6 +72,8 @@ ports:
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 `POST /thread-sla/evaluate` 锚点邮件未知返回 **404**，锚点为环内邮件返回 **409**。
+`POST /thread-subject-audit` 同样：锚点邮件未知返回 **404**，锚点为环内邮件返回
+**409**（请求体空白 `message_id` 返回 **422**）。
 `POST /thread-corrections` 的错误码见下节（待调整邮件 / 目标父未知 **404**；
 环内邮件、revision 不匹配、自挂/成环均为 **409** 且不写库）。
 
@@ -397,6 +401,73 @@ curl -X POST http://localhost:8000/thread-sla/evaluate \
   ],
   "summary": {"total": 3, "within_sla": 1, "late": 1, "pending": 1, "overdue": 0},
   "chronology_anomalies": []            // sent_at 早于父邮件的直接子邮件
+}
+```
+
+### 主题漂移审计：`POST /thread-subject-audit`
+
+以会话内**任意一封有效邮件为锚点**，对其**当前所在的整棵有效会话**做只读的
+主题漂移审计。接口**只读**：不写库、不改写批次快照与诊断明细。
+
+主题先做**规范化**得到 `canonical_subject`：
+
+- **重复剥离前缀**：主题开头的 `Re:` / `Fw:` / `Fwd:`（含 `RE:`、`fw:` 等
+  任意大小写组合，标记与冒号之间允许空白）从左到右逐个剥离，直到不再以该类
+  前缀开头（`Re: Fwd: 主题` → `主题`）；没有冒号的 `Re 主题` 不算前缀；
+- **折叠空白**：把所有连续空白（空格、制表符、换行）折叠为单个空格并去掉
+  首尾空白；规范化只作用于前缀标记的大小写，正文大小写原样保留。
+
+随后按与 `GET /threads/{message_id}` 完全一致的 **`(sent_at, message_id)`
+稳定先序**遍历整棵会话：
+
+- 每个节点以其**最近祖先**（即直接父节点；先序遍历中父节点总是先于子节点）
+  的规范主题作为**分支基线** `baseline_subject`；规范主题与基线**精确比较**
+  （区分大小写），不同即 `drifted: true`；
+- **根节点**没有祖先：`baseline_subject` 为 `null`，`drifted` 恒为 `false`；
+- 先序序列中**连续偏离**的节点合并为一个 `drift_groups` 条目（连续段可以
+  跨越不同子分支：一个分支的末尾与下一分支的开头都偏离时仍合并），每组给出
+  `start_message_id` / `end_message_id` / 先序 `message_ids` / `count`。
+
+响应还包含审计基于的当前整棵会话拓扑 `revision`（与 `GET /threads/{message_id}`
+一致）与 `root_id`；`results` 逐节点给出原主题 `subject`、规范主题、基线、
+`drifted` 与 `depth`。锚点邮件未知返回 **404**；锚点为环内 `invalid` 邮件
+（不属于任何会话）返回 **409**。
+
+```bash
+curl -X POST http://localhost:8000/thread-subject-audit \
+  -H 'Content-Type: application/json' -d '{"message_id": "C"}'
+```
+
+对上例 `A「例会通知」 <- B「Re: 例会通知」 <- C「Re: 例会通知」`，若 A 另有
+子节点 D「Re: 改期讨论」，响应：
+
+```jsonc
+{
+  "message_id": "C",
+  "root_id": "A",
+  "revision": "9f1a…",                 // 与 GET /threads/C 相同的拓扑摘要
+  "results": [                          // 稳定先序：A -> B -> C -> D
+    {"message_id": "A", "parent_id": null, "depth": 0,
+     "sent_at": "2026-09-18T08:00:00Z",
+     "subject": "例会通知", "canonical_subject": "例会通知",
+     "baseline_subject": null, "drifted": false},
+    {"message_id": "B", "parent_id": "A", "depth": 1,
+     "sent_at": "2026-09-18T08:30:00Z",
+     "subject": "Re: 例会通知", "canonical_subject": "例会通知",
+     "baseline_subject": "例会通知", "drifted": false},
+    {"message_id": "C", "parent_id": "B", "depth": 2,
+     "sent_at": "2026-09-18T10:30:00Z",
+     "subject": "Re: 例会通知", "canonical_subject": "例会通知",
+     "baseline_subject": "例会通知", "drifted": false},
+    {"message_id": "D", "parent_id": "A", "depth": 1,
+     "sent_at": "2026-09-18T11:00:00Z",
+     "subject": "Re: 改期讨论", "canonical_subject": "改期讨论",
+     "baseline_subject": "例会通知", "drifted": true}
+  ],
+  "drift_groups": [
+    {"start_message_id": "D", "end_message_id": "D",
+     "message_ids": ["D"], "count": 1}
+  ]
 }
 ```
 
